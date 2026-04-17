@@ -44,14 +44,18 @@
 #include <rcl_interfaces/msg/integer_range.hpp>
 #include <builtin_interfaces/msg/duration.hpp>
 #include <yaml-cpp/yaml.h>
+#include <neo_waypoint_follower/msg/execution_context.hpp>
 #include <neo_waypoint_follower/msg/looper_metrics.hpp>
 #include <neo_waypoint_follower/msg/run_history_entry.hpp>
 #include <neo_waypoint_follower/msg/waypoints.hpp>
+#include <neo_waypoint_follower/srv/start_single_goal.hpp>
 #include <neo_waypoint_follower/srv/run_history_list.hpp>
 #include <neo_waypoint_follower/srv/run_history_delete.hpp>
 #include <neo_waypoint_follower/srv/run_history_clear.hpp>
+using ExecutionContext = neo_waypoint_follower::msg::ExecutionContext;
 using LooperMetrics = neo_waypoint_follower::msg::LooperMetrics;
 using RunHistoryEntryMsg = neo_waypoint_follower::msg::RunHistoryEntry;
+using StartSingleGoalSrv = neo_waypoint_follower::srv::StartSingleGoal;
 using RunHistoryListSrv = neo_waypoint_follower::srv::RunHistoryList;
 using RunHistoryDeleteSrv = neo_waypoint_follower::srv::RunHistoryDelete;
 using RunHistoryClearSrv = neo_waypoint_follower::srv::RunHistoryClear;
@@ -120,6 +124,10 @@ public:
       "start_waypoint_loop",
       std::bind(&WaypointLooper::startCallback, this, std::placeholders::_1, std::placeholders::_2));
 
+    start_single_goal_srv_ = create_service<StartSingleGoalSrv>(
+      "start_single_goal",
+      std::bind(&WaypointLooper::startSingleGoalCallback, this, std::placeholders::_1, std::placeholders::_2));
+
     pause_srv_ = create_service<std_srvs::srv::Trigger>(
       "pause_waypoint_loop",
       std::bind(&WaypointLooper::pauseCallback, this, std::placeholders::_1, std::placeholders::_2));
@@ -169,11 +177,21 @@ public:
       "/waypoint_loop/loaded_waypoints",
       rclcpp::QoS(1).transient_local());
 
+    executing_waypoints_pub_ = create_publisher<neo_waypoint_follower::msg::Waypoints>(
+      "/waypoint_loop/executing_waypoints",
+      rclcpp::QoS(1).transient_local());
+
+    execution_context_pub_ = create_publisher<ExecutionContext>(
+      "/waypoint_loop/execution_context",
+      rclcpp::QoS(1).transient_local());
+
     // Service to publish the loaded waypoints once
     publish_loaded_waypoints_srv_ = create_service<std_srvs::srv::Trigger>(
       "publish_loaded_waypoints",
       std::bind(&WaypointLooper::publishLoadedWaypointsCallback, this,
                 std::placeholders::_1, std::placeholders::_2));
+
+    publishExecutionState_();
 
     if (!loadRunHistoryFromDisk_()) {
       RCLCPP_WARN(
@@ -473,8 +491,15 @@ private:
     run_route_waypoints_ = static_cast<uint32_t>(waypoints_.size());
     run_loop_count_ = static_cast<uint32_t>(effective_repeat_count());
     run_wait_ms_ = effective_delay_ms();
-    run_yaml_file_ = active_yaml_file_;
-    run_route_name_ = deriveRouteName_();
+    run_yaml_file_ = execution_yaml_file_;
+    run_route_name_ = execution_display_name_.empty() ? deriveRouteName_() : execution_display_name_;
+
+    if (execution_kind_ == ExecutionContext::EXECUTION_DIRECT_SINGLE_GOAL) {
+      run_route_description_.clear();
+      run_has_loop_ = false;
+      return;
+    }
+
     run_route_description_ = trimCopy_(loaded_route_description_);
 
     bool inferred_has_loop = has_loop_param_;
@@ -809,19 +834,17 @@ private:
   {
     if (starting_.exchange(true)) { res->success = false; res->message = "Start already in progress"; return; }
     if (running_ || goal_in_flight_) { starting_ = false; res->success = false; res->message = "Already running; pause or cancel first"; return; }
-    if (!loadYaml() || waypoints_.empty()) { starting_ = false; res->success = false; res->message = "No poses in YAML"; return; }
+    if (!loadYaml() || loaded_waypoints_.empty()) { starting_ = false; res->success = false; res->message = "No poses in YAML"; return; }
     if (!nav_to_pose_client_->wait_for_action_server(std::chrono::seconds(5))) {
       starting_ = false; res->success = false; res->message = "NavigateToPose server not up"; return;
     }
 
-    // Detect single-goal mode (only one waypoint in YAML)
-    single_goal_mode_ = (waypoints_.size() == 1);
+    prepareExecutionFromLoadedRoute_();
 
-    // clear flags/indices
     paused_ = false;
+    cancel_requested_ = false;
     if (delay_timer_) delay_timer_->cancel();
 
-    // Reset odometry and progress tracking
     run_distance_ = 0.0;
     leg_distance_ = 0.0;
     run_context_active_ = false;
@@ -831,7 +854,6 @@ private:
     running_        = true;
     goal_in_flight_ = false;
 
-    // Reset indices for loop and waypoint
     loop_idx_       = 0;
     wp_idx_         = 0;
 
@@ -840,6 +862,7 @@ private:
     resetNav2Feedback_();
     resetNav2Result_();
     beginRunContext_();
+    publishExecutionState_();
     publishMetrics_();
     sendNext();
     starting_ = false;
@@ -847,6 +870,49 @@ private:
     res->message = single_goal_mode_ ? "Started Single Goal Mode" : "Started Waypoint Loop Mode";
     RCLCPP_INFO(get_logger(), "%s started.",
                 single_goal_mode_ ? "Single-goal navigation" : "Waypoint loop");
+  }
+
+
+  void startSingleGoalCallback(
+    const std::shared_ptr<StartSingleGoalSrv::Request> req,
+    std::shared_ptr<StartSingleGoalSrv::Response> res)
+  {
+    if (starting_.exchange(true)) { res->success = false; res->message = "Start already in progress"; return; }
+    if (running_ || goal_in_flight_) { starting_ = false; res->success = false; res->message = "Already running; pause or cancel first"; return; }
+    if (!nav_to_pose_client_->wait_for_action_server(std::chrono::seconds(5))) {
+      starting_ = false; res->success = false; res->message = "NavigateToPose server not up"; return;
+    }
+
+    prepareExecutionFromSingleGoal_(req->pose, req->label);
+
+    paused_ = false;
+    cancel_requested_ = false;
+    if (delay_timer_) delay_timer_->cancel();
+
+    run_distance_ = 0.0;
+    leg_distance_ = 0.0;
+    run_context_active_ = false;
+    run_pause_count_ = 0;
+
+    have_last_odom_ = false;
+    running_        = true;
+    goal_in_flight_ = false;
+
+    loop_idx_       = 0;
+    wp_idx_         = 0;
+
+    looper_state_ = LooperMetrics::LOOPER_RUNNING;
+    status_message_ = "Single-goal run started";
+    resetNav2Feedback_();
+    resetNav2Result_();
+    beginRunContext_();
+    publishExecutionState_();
+    publishMetrics_();
+    sendNext();
+    starting_ = false;
+    res->success = true;
+    res->message = "Started Single Goal Mode";
+    RCLCPP_INFO(get_logger(), "Direct single-goal navigation started.");
   }
 
   /**
@@ -913,10 +979,14 @@ private:
     status_message_ = "Canceled and reset";
     finalizeRunHistory_("CANCELLED", "USER_CANCELLED");
 
-    // Cancel timer and active goal, reset all indices and progress
     if (delay_timer_) delay_timer_->cancel();
     paused_ = false; running_ = false; goal_in_flight_ = false; starting_ = false;
-    if (current_goal_) { auto future = nav_to_pose_client_->async_cancel_goal(current_goal_); (void)future; current_goal_.reset(); }
+    cancel_requested_ = static_cast<bool>(current_goal_);
+    if (current_goal_) {
+      auto future = nav_to_pose_client_->async_cancel_goal(current_goal_);
+      (void)future;
+      current_goal_.reset();
+    }
     loop_idx_ = 0; wp_idx_ = 0;
     run_distance_ = 0.0; leg_distance_ = 0.0; have_last_odom_ = false;
     looper_state_ = LooperMetrics::LOOPER_IDLE;
@@ -925,6 +995,8 @@ private:
     res->success = true; res->message = "Canceled and reset.";
     RCLCPP_INFO(get_logger(), "Waypoint loop canceled and reset.");
     publishMetrics_();
+    clearExecutionState_(true);
+    publishExecutionState_();
   }
 
   /**
@@ -938,9 +1010,14 @@ private:
   bool loadYaml() {
     try {
       std::string yaml_path = yaml_file_;
-      // use the updated value if file path has been changed at runtime
       (void)this->get_parameter("yaml_file", yaml_path);
       active_yaml_file_ = yaml_path;
+      loaded_route_name_.clear();
+      loaded_route_description_.clear();
+      loaded_has_loop_ = false;
+      loaded_has_loop_set_ = false;
+      loaded_waypoints_.clear();
+
       YAML::Node root = YAML::LoadFile(yaml_path);
       YAML::Node waypoints = root["waypoints"];
       if (!waypoints || !waypoints.IsMap()) {
@@ -948,10 +1025,6 @@ private:
         return false;
       }
 
-      loaded_route_name_.clear();
-      loaded_route_description_.clear();
-      loaded_has_loop_ = false;
-      loaded_has_loop_set_ = false;
       YAML::Node metadata = root["metadata"];
       if (metadata && metadata.IsMap()) {
         loaded_route_name_ = trimCopy_(nodeScalarOr_(metadata["name"], std::string()));
@@ -962,9 +1035,6 @@ private:
         }
       }
 
-      waypoints_.clear();
-
-      // loop through waypoints
       for (auto it = waypoints.begin(); it != waypoints.end(); ++it) {
         const std::string name = it->first.as<std::string>();
         const YAML::Node & p = it->second;
@@ -977,10 +1047,10 @@ private:
         pose_stamped.pose.orientation.y = p["orientation"]["y"].as<double>();
         pose_stamped.pose.orientation.z = p["orientation"]["z"].as<double>();
         pose_stamped.pose.orientation.w = p["orientation"]["w"].as<double>();
-        waypoints_.push_back({name, pose_stamped});
+        loaded_waypoints_.push_back({name, pose_stamped});
       }
       return true;
-    } 
+    }
     catch (const YAML::BadFile & e) {
       RCLCPP_ERROR(get_logger(), "Failed to open YAML file: %s", e.what());
       return false;
@@ -991,17 +1061,17 @@ private:
     }
   }
 
-  neo_waypoint_follower::msg::Waypoints buildLoadedWaypointsMsg_()
+  neo_waypoint_follower::msg::Waypoints buildWaypointsMsg_(
+    const std::vector<std::pair<std::string, geometry_msgs::msg::PoseStamped>> & waypoints_source)
   {
     neo_waypoint_follower::msg::Waypoints msg;
     msg.header.stamp = now();
     msg.header.frame_id = frame_id_;
 
-    // pre-allocate room for exactly the waypoints we have for efficiency
-    msg.names.reserve(waypoints_.size());
-    msg.poses.reserve(waypoints_.size());
+    msg.names.reserve(waypoints_source.size());
+    msg.poses.reserve(waypoints_source.size());
 
-    for (const auto & pair : waypoints_) {
+    for (const auto & pair : waypoints_source) {
       msg.names.push_back(pair.first);
 
       auto ps = pair.second;
@@ -1014,6 +1084,80 @@ private:
       msg.poses.push_back(ps);
     }
     return msg;
+  }
+
+  neo_waypoint_follower::msg::Waypoints buildLoadedWaypointsMsg_()
+  {
+    return buildWaypointsMsg_(loaded_waypoints_);
+  }
+
+  neo_waypoint_follower::msg::Waypoints buildExecutingWaypointsMsg_()
+  {
+    return buildWaypointsMsg_(waypoints_);
+  }
+
+  void publishExecutionState_()
+  {
+    if (executing_waypoints_pub_) {
+      executing_waypoints_pub_->publish(buildExecutingWaypointsMsg_());
+    }
+    if (!execution_context_pub_) {
+      return;
+    }
+
+    ExecutionContext msg;
+    msg.header.stamp = now();
+    msg.header.frame_id = frame_id_;
+    msg.execution_kind = execution_kind_;
+    msg.display_name = execution_display_name_;
+    if (execution_kind_ == ExecutionContext::EXECUTION_ROUTE) {
+      msg.route_name = execution_display_name_;
+      msg.yaml_file = execution_yaml_file_;
+    }
+    msg.pause_resume_available = execution_kind_ != ExecutionContext::EXECUTION_NONE;
+    execution_context_pub_->publish(msg);
+  }
+
+  void prepareExecutionFromLoadedRoute_()
+  {
+    waypoints_ = loaded_waypoints_;
+    execution_kind_ = ExecutionContext::EXECUTION_ROUTE;
+    execution_display_name_ = deriveRouteName_();
+    execution_yaml_file_ = active_yaml_file_;
+    single_goal_mode_ = (waypoints_.size() == 1);
+  }
+
+  void prepareExecutionFromSingleGoal_(geometry_msgs::msg::PoseStamped pose, const std::string & requested_label)
+  {
+    auto label = trimCopy_(requested_label);
+    if (label.empty()) {
+      label = "Navigate to Pose";
+    }
+    if (pose.header.frame_id.empty()) {
+      pose.header.frame_id = frame_id_;
+    }
+    if (pose.header.stamp.sec == 0 && pose.header.stamp.nanosec == 0) {
+      pose.header.stamp = now();
+    }
+
+    waypoints_.clear();
+    waypoints_.push_back({label, pose});
+    execution_kind_ = ExecutionContext::EXECUTION_DIRECT_SINGLE_GOAL;
+    execution_display_name_ = label;
+    execution_yaml_file_.clear();
+    single_goal_mode_ = true;
+  }
+
+  void clearExecutionState_(bool clear_current_waypoint_name = true)
+  {
+    waypoints_.clear();
+    execution_kind_ = ExecutionContext::EXECUTION_NONE;
+    execution_display_name_.clear();
+    execution_yaml_file_.clear();
+    if (clear_current_waypoint_name) {
+      current_waypoint_name_.clear();
+    }
+    single_goal_mode_ = false;
   }
 
   void publishLoadedWaypointsCallback(
@@ -1029,7 +1173,7 @@ private:
     // Reload from YAML so updates on disk are reflected here
     (void)loadYaml();
 
-    if (waypoints_.empty()) {
+    if (loaded_waypoints_.empty()) {
       res->success = false;
       res->message = "No waypoints loaded (YAML empty or load failed)";
       return;
@@ -1087,6 +1231,9 @@ private:
       [this](rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr,
              const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> fb)
       {
+        if (!running_ || cancel_requested_) {
+          return;
+        }
         eta_msg_       = fb->estimated_time_remaining;
         nav_time_msg_  = fb->navigation_time;
         distance_remaining_ = fb->distance_remaining;
@@ -1115,6 +1262,10 @@ private:
       {
         goal_in_flight_ = false;
         current_goal_.reset();
+        if (cancel_requested_) {
+          cancel_requested_ = false;
+          return;
+        }
         nav_result_code_ = static_cast<uint8_t>(result.code);
         if (result.result) {
           nav_error_code_ = result.result->error_code;
@@ -1232,6 +1383,10 @@ private:
     } else {
       RCLCPP_INFO(get_logger(), "Completed %zu loop(s).", repeat_count_);
     }
+
+    cancel_requested_ = false;
+    clearExecutionState_(false);
+    publishExecutionState_();
   }
 
   /**
@@ -1310,11 +1465,17 @@ private:
   inline int    effective_delay_ms()    const { return single_goal_mode_ ? 0 : wait_ms_descriptor_; }
 
   std::vector<std::pair<std::string, geometry_msgs::msg::PoseStamped>> waypoints_;
+  std::vector<std::pair<std::string, geometry_msgs::msg::PoseStamped>> loaded_waypoints_;
   std::string active_yaml_file_;
   std::string loaded_route_name_;
   std::string loaded_route_description_;
   bool loaded_has_loop_ = false;
   bool loaded_has_loop_set_ = false;
+
+  uint8_t execution_kind_ = ExecutionContext::EXECUTION_NONE;
+  std::string execution_display_name_;
+  std::string execution_yaml_file_;
+  bool cancel_requested_ = false;
 
   bool run_context_active_ = false;
   uint64_t run_started_at_ms_ = 0;
@@ -1344,6 +1505,8 @@ private:
   rclcpp::Publisher<LooperMetrics>::SharedPtr metrics_pub_;
   rclcpp::TimerBase::SharedPtr metrics_timer_;
   rclcpp::Publisher<neo_waypoint_follower::msg::Waypoints>::SharedPtr loaded_waypoints_pub_;
+  rclcpp::Publisher<neo_waypoint_follower::msg::Waypoints>::SharedPtr executing_waypoints_pub_;
+  rclcpp::Publisher<ExecutionContext>::SharedPtr execution_context_pub_;
 
   uint8_t looper_state_ = LooperMetrics::LOOPER_IDLE;
   builtin_interfaces::msg::Duration eta_msg_{};
@@ -1358,6 +1521,7 @@ private:
   rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SharedPtr nav_to_pose_client_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr
   start_srv_, cancel_srv_, pause_srv_, resume_srv_, publish_loaded_waypoints_srv_;
+  rclcpp::Service<StartSingleGoalSrv>::SharedPtr start_single_goal_srv_;
   rclcpp::Service<RunHistoryListSrv>::SharedPtr run_history_list_srv_;
   rclcpp::Service<RunHistoryDeleteSrv>::SharedPtr run_history_delete_srv_;
   rclcpp::Service<RunHistoryClearSrv>::SharedPtr run_history_clear_srv_;

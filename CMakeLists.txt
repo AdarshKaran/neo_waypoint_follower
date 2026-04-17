@@ -28,9 +28,11 @@ find_package(rcl_interfaces REQUIRED)
 
 # Interface generation
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/ExecutionContext.msg"
   "msg/LooperMetrics.msg"
   "msg/RunHistoryEntry.msg"
   "msg/Waypoints.msg"
+  "srv/StartSingleGoal.srv"
   "srv/RunHistoryList.srv"
   "srv/RunHistoryDelete.srv"
   "srv/RunHistoryClear.srv"

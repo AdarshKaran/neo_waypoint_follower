@@ -38,7 +38,8 @@ It provides two core functionalities:
 - **Purpose:** Loads waypoints from a YAML file and sends navigation goals to the Nav2 stack, looping through the waypoints as configured.
 - **Modes:**
   - **Waypoint Loop Mode:** Loops through all waypoints for the specified number of repeats (`repeat_count`).
-  - **Single Goal Mode:** If only one waypoint is loaded, the node switches to single-goal navigation and executes just that goal once.
+  - **Route Single Goal Mode:** If only one waypoint is loaded from YAML, the node switches to single-goal navigation and executes just that goal once.
+  - **Direct Single Goal Mode:** A single pose can be started directly through `/start_single_goal` without mutating the loaded YAML route.
 - **Parameters:**
   - `yaml_file` (string): Path to the waypoints YAML file
   - `frame_id` (string): Frame ID for waypoints (default: `map`)
@@ -53,10 +54,11 @@ It provides two core functionalities:
   - `odom_topic` (string): Odometry topic for distance tracking (default: `/odom`)
 
 - **Services:**
-  - `/start_waypoint_loop` (`std_srvs/srv/Trigger`): Starts the waypoint loop or single-goal mode
-  - `/pause_waypoint_loop` (`std_srvs/srv/Trigger`): Pauses the waypoint loop
-  - `/resume_waypoint_loop` (`std_srvs/srv/Trigger`): Resumes the waypoint loop
-  - `/cancel_waypoint_loop` (`std_srvs/srv/Trigger`): Cancels and resets the waypoint loop
+  - `/start_waypoint_loop` (`std_srvs/srv/Trigger`): Starts the waypoint loop or route single-goal mode from the loaded YAML route
+  - `/start_single_goal` (`neo_waypoint_follower/srv/StartSingleGoal`): Starts direct single-goal execution from a `PoseStamped` request without changing the loaded YAML route
+  - `/pause_waypoint_loop` (`std_srvs/srv/Trigger`): Pauses the active execution
+  - `/resume_waypoint_loop` (`std_srvs/srv/Trigger`): Resumes the active execution
+  - `/cancel_waypoint_loop` (`std_srvs/srv/Trigger`): Cancels and resets the active execution
   - `/publish_loaded_waypoints` (`std_srvs/srv/Trigger`): Publishes the currently loaded waypoints once to a latched topic
   - `/run_history/list` (`neo_waypoint_follower/srv/RunHistoryList`): Lists navigation runs. If persistence backend is degraded, service returns `success=false` with an error `message` but may still include last-known in-memory `entries`.
   - `/run_history/delete` (`neo_waypoint_follower/srv/RunHistoryDelete`): Deletes one run by `run_id`
@@ -64,7 +66,9 @@ It provides two core functionalities:
 
 - **Topics:**
   - `/waypoint_loop/metrics` (`neo_waypoint_follower/msg/LooperMetrics`): Aggregated looper metrics (QoS: best_effort, durability_volatile)
-  - `/waypoint_loop/loaded_waypoints` (`neo_waypoint_follower/msg/Waypoints`): Names + poses for the currently loaded waypoints (QoS: reliable, transient_local)
+  - `/waypoint_loop/loaded_waypoints` (`neo_waypoint_follower/msg/Waypoints`): Names + poses for the currently loaded YAML route (QoS: reliable, transient_local)
+  - `/waypoint_loop/executing_waypoints` (`neo_waypoint_follower/msg/Waypoints`): Names + poses for the execution plan currently being driven (QoS: reliable, transient_local)
+  - `/waypoint_loop/execution_context` (`neo_waypoint_follower/msg/ExecutionContext`): Latched execution source metadata for the active run (QoS: reliable, transient_local)
 
 - **Message: `neo_waypoint_follower/LooperMetrics`**
   - `std_msgs/Header header`
@@ -97,6 +101,18 @@ It provides two core functionalities:
   - `string[] names`
   - `geometry_msgs/PoseStamped[] poses`
 
+- **Message: `neo_waypoint_follower/ExecutionContext`**
+  - `std_msgs/Header header`
+  - `uint8 execution_kind` (`EXECUTION_NONE`, `EXECUTION_ROUTE`, `EXECUTION_DIRECT_SINGLE_GOAL`)
+  - `string display_name`
+  - `string route_name`
+  - `string yaml_file`
+  - `bool pause_resume_available`
+
+- **Service: `neo_waypoint_follower/StartSingleGoal`**
+  - Request: `geometry_msgs/PoseStamped pose`, `string label`
+  - Response: `bool success`, `string message`
+
 - **Message: `neo_waypoint_follower/RunHistoryEntry`**
   - Identity/timing: `run_id`, `started_at_ms`, `ended_at_ms`, `status`, `cause_code`
   - Route snapshot: `route_name`, `route_description`, `yaml_file`, `route_waypoints`
@@ -107,8 +123,11 @@ It provides two core functionalities:
 - **Behavior Notes:**
   - Lowering `repeat_count` below the current loop index will cause the run to finish right after the current goal completes.
   - Changing `wait_at_waypoint_ms` does not affect an already running timer; it takes effect from the next waypoint.
-  - If only one waypoint is loaded, single-goal mode is activated automatically.
-  - Start-time busy conditions are reported by `/start_waypoint_loop` Trigger response (`success=false`, message).
+  - If only one waypoint is loaded, route single-goal mode is activated automatically.
+  - `/start_single_goal` adds a direct single-goal execution path without replacing the existing one-waypoint-route behavior.
+  - `/pause_waypoint_loop`, `/resume_waypoint_loop`, and `/cancel_waypoint_loop` apply to both route execution and direct single-goal execution.
+  - Starting a direct single-goal does not mutate the loaded YAML route.
+  - Start-time busy conditions are reported by `/start_waypoint_loop` or `/start_single_goal` service responses (`success=false`, message).
   - Runtime action failures (for example ABORTED) are surfaced via `LOOPER_ERROR` + `nav_result_code/nav_error_code/nav_error_msg`.
   - Run history is written by `waypoint_looper` to:
     - `/var/lib/neo/lemma-gui/history/navigation_runs.json`
