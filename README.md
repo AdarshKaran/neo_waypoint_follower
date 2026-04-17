@@ -157,6 +157,7 @@ ros2 launch neo_waypoint_follower waypoint_follower_launch.py
 | waypoints_topic     | `/waypoints`                   | Topic to listen to for waypoints                    |
 | save_waypoints_path | `<pkg>/config/waypoints.yaml`  | Path used by `save_waypoints_server`                |
 | load_waypoints_path | `<pkg>/config/waypoints.yaml`  | Path used by `waypoint_looper`                      |
+| vault_dir           | `/var/lib/neo/lemma-gui/waypoints` | Path used by `vault_manager` for persisted waypoint YAMLs |
 | frame_id            | `map`                          | Frame ID for waypoints                              |
 | repeat_count        | `10`                           | Number of times to repeat the loop                  |
 | wait_at_waypoint_ms | `500`                          | Time to wait at each waypoint (ms)                  |
