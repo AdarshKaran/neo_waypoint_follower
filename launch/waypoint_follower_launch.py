@@ -28,7 +28,7 @@ def execution_stage(context,
     frame_id_val = frame_id.perform(context)
     repeat_count_val = int(repeat_count.perform(context))
     wait_at_waypoint_ms_val = int(wait_at_waypoint_ms.perform(context))
-    stop_on_failure_val = bool(stop_on_failure.perform(context))
+    stop_on_failure_val = str(stop_on_failure.perform(context)).lower() == 'true'
 
     save_waypoints_server_node = Node(
         package='neo_waypoint_follower',
